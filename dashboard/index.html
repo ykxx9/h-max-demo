@@ -7,122 +7,183 @@
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --ink:#10161B; --panel:#19222B; --panel-2:#1E2932; --line:#2A3541;
-    --trace:#4FD8C4; --trace-dim:#2C6E64; --raw:#8B97A2; --alert:#FF6B54;
+    --ink:#10161B; --panel:#19222B; --line:#2A3541;
+    --raw:#8B97A2; --filt:#4FD8C4; --filt-dim:#2C6E64;
+    --ax:#4FD8C4; --ay:#F2C94C; --az:#6FA8FF;
+    --alert:#FF6B54; --alert-bg:#3A1C16;
     --text:#ECEDE9; --muted:#8B97A2;
   }
   *{box-sizing:border-box;}
   html,body{margin:0;background:var(--ink);color:var(--text);font-family:'Sora',sans-serif;}
   body{padding:24px;min-height:100vh;}
-  .wrap{max-width:1000px;margin:0 auto;}
-  h1{font-size:19px;margin:0 0 4px 0;}
-  .sub{color:var(--muted);font-size:13px;margin:0 0 20px 0;}
+  .wrap{max-width:900px;margin:0 auto;}
+  h1{font-size:18px;margin:0 0 4px 0;}
+  .sub{color:var(--muted);font-size:12.5px;margin:0 0 16px 0;}
 
   .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;}
-  button{font-family:'Sora',sans-serif;font-weight:600;font-size:13.5px;padding:10px 18px;border-radius:8px;
-    border:1px solid var(--line);background:var(--panel-2);color:var(--text);cursor:pointer;}
-  button:hover{border-color:var(--trace-dim);}
-  button.primary{background:var(--trace);color:#0B1512;border-color:var(--trace);}
-  .status{font-family:'IBM Plex Mono',monospace;font-size:12px;padding:6px 12px;border-radius:20px;
+  button{font-family:'Sora',sans-serif;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;
+    border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer;}
+  button:hover{border-color:var(--filt-dim);}
+  button.primary{background:var(--filt);color:#0B1512;border-color:var(--filt);}
+  .status{font-family:'IBM Plex Mono',monospace;font-size:11.5px;padding:5px 11px;border-radius:20px;
     border:1px solid var(--line);color:var(--muted);}
-  .status.on{color:var(--trace);border-color:var(--trace-dim);}
+  .status.on{color:var(--filt);border-color:var(--filt-dim);}
+  .bpm{margin-left:auto;font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:600;color:var(--filt);}
+  .bpm .unit{font-size:11px;color:var(--muted);font-weight:400;margin-left:4px;}
 
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:16px;}
-  .card h2{font-size:12.5px;font-weight:600;color:var(--muted);margin:0 0 12px 0;}
-  canvas{width:100%;height:220px;background:#0D1317;border-radius:8px;border:1px solid var(--line);}
-  .legend{display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--muted);}
-  .legend span{display:inline-flex;align-items:center;gap:6px;}
-  .dot{width:10px;height:10px;border-radius:2px;}
+  .banner{display:none;background:var(--alert-bg);border:1px solid var(--alert);color:var(--alert);
+    border-radius:8px;padding:10px 14px;font-size:12.5px;margin-bottom:14px;font-family:'IBM Plex Mono',monospace;}
+  .banner.show{display:block;}
 
-  .row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;}
-  .vital{background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:14px;text-align:center;}
-  .vital .label{font-size:11px;color:var(--muted);margin-bottom:6px;}
-  .vital .value{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:var(--trace);}
-  .vital .unit{font-size:11px;color:var(--muted);}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px;}
+  .panel h2{font-size:11.5px;font-weight:600;color:var(--muted);margin:0 0 8px 0;
+    display:flex;justify-content:space-between;}
+  .panel h2 .legend{display:flex;gap:12px;font-weight:400;}
+  .panel h2 .legend span{display:inline-flex;align-items:center;gap:5px;}
+  .dot{width:8px;height:8px;border-radius:2px;display:inline-block;}
+  .chart-wrap{position:relative;}
+  canvas{width:100%;height:130px;display:block;background:#0D1317;border-radius:6px;border:1px solid var(--line);}
+  .axis-label{position:absolute;right:6px;font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);
+    pointer-events:none;}
+  .axis-label.top{top:4px;}
+  .axis-label.bottom{bottom:4px;}
+
+  .footer{color:var(--muted);font-size:11px;margin-top:4px;font-family:'IBM Plex Mono',monospace;min-height:14px;}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>ESP32-S3 — ECG + IMU Live</h1>
+  <h1>ESP32-S3 — ECG + IMU</h1>
   <p class="sub">Web Serial, 115200 baud. Close Arduino IDE's Serial Monitor/Plotter first — only one program can hold the port.</p>
 
   <div class="bar">
     <button class="primary" id="btnConnect">Connect device</button>
     <span class="status" id="statusPill">Not connected</span>
+    <span class="bpm" id="bpmVal">— <span class="unit">bpm</span></span>
   </div>
 
-  <div class="card">
-    <h2>ECG — raw vs. filtered</h2>
-    <canvas id="ecg"></canvas>
-    <div class="legend">
-      <span><span class="dot" style="background:#8B97A2"></span>Raw</span>
-      <span><span class="dot" style="background:#4FD8C4"></span>Filtered</span>
+  <div class="banner" id="accelBanner"></div>
+
+  <div class="panel">
+    <h2>Raw ECG <span class="legend"><span><span class="dot" style="background:var(--raw)"></span>ADC counts, 0–4095</span></span></h2>
+    <div class="chart-wrap">
+      <canvas id="rawChart"></canvas>
+      <span class="axis-label top">4095</span>
+      <span class="axis-label bottom">0</span>
     </div>
   </div>
 
-  <div class="row">
-    <div class="vital"><div class="label">Heart Rate</div><div class="value" id="bpmVal">—</div><div class="unit">bpm</div></div>
-    <div class="vital"><div class="label">Accel X</div><div class="value" id="axVal">—</div><div class="unit">m/s²</div></div>
-    <div class="vital"><div class="label">Accel Y</div><div class="value" id="ayVal">—</div><div class="unit">m/s²</div></div>
-    <div class="vital"><div class="label">Accel Z</div><div class="value" id="azVal">—</div><div class="unit">m/s²</div></div>
+  <div class="panel">
+    <h2>Filtered ECG <span class="legend"><span><span class="dot" style="background:var(--filt)"></span>0.5–40Hz + 50Hz notch</span></span></h2>
+    <div class="chart-wrap">
+      <canvas id="filtChart"></canvas>
+      <span class="axis-label top">+1000</span>
+      <span class="axis-label bottom">−1000</span>
+    </div>
   </div>
+
+  <div class="panel">
+    <h2>IMU — accel <span class="legend">
+      <span><span class="dot" style="background:var(--ax)"></span>X</span>
+      <span><span class="dot" style="background:var(--ay)"></span>Y</span>
+      <span><span class="dot" style="background:var(--az)"></span>Z</span>
+    </span></h2>
+    <div class="chart-wrap">
+      <canvas id="imuChart"></canvas>
+      <span class="axis-label top">+20 m/s²</span>
+      <span class="axis-label bottom">−20 m/s²</span>
+    </div>
+  </div>
+
+  <div class="footer" id="deviceMsg"></div>
 </div>
 
 <script>
-const canvas = document.getElementById('ecg');
-const ctx = canvas.getContext('2d');
-function fitCanvas(){
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-}
-window.addEventListener('resize', fitCanvas);
-fitCanvas();
+// Fixed axis ranges -- deliberately NOT auto-scaled to each frame's own
+// min/max. Auto-scaling per frame always stretches whatever's on screen to
+// fill the chart, so flat noise looks like a dramatic wave and a sensor
+// pinned at its physical limit looks like a normal-sized peak. Fixed
+// ranges tied to real physical/ADC limits make amplitude comparable across
+// time and make saturation visually obvious (a trace pinned at the edge).
+const RAW_RANGE = [0, 4095];       // 12-bit ADC (analogReadResolution(12))
+const FILT_RANGE = [-1000, 1000];  // expected swing post highpass+notch; widen if your trace clips
+const ACCEL_RANGE = [-20, 20];     // m/s^2 -- matches the MPU6050's own +-2g limit (+-19.61 m/s^2)
+const ACCEL_SAT_ON = 18.5;         // warn near the physical rail
+const ACCEL_SAT_OFF = 17.5;        // hysteresis so the banner doesn't flicker
 
-const BUF_LEN = 500;
-let rawBuf = [];
-let filtBuf = [];
+const BUF_LEN = 500; // 2s at 250Hz
+let rawBuf = [], filtBuf = [], axBuf = [], ayBuf = [], azBuf = [];
 let port, reader, keepReading = false;
 let lineBuf = '';
 let headerSeen = false;
+let accelSaturated = false;
 
-function drawGrid(w,h){
-  ctx.strokeStyle = '#182028'; ctx.lineWidth = 1;
-  for(let x=0;x<w;x+=25){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
-  for(let y=0;y<h;y+=25){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+function setupCanvas(canvas){
+  const ctx = canvas.getContext('2d');
+  function fit(){
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener('resize', fit);
+  fit();
+  return ctx;
 }
 
-function drawTrace(buf, color, w, h, lo, hi){
+const rawCtx = setupCanvas(document.getElementById('rawChart'));
+const filtCtx = setupCanvas(document.getElementById('filtChart'));
+const imuCtx = setupCanvas(document.getElementById('imuChart'));
+
+function drawGrid(ctx, w, h){
+  ctx.strokeStyle = '#182028'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke(); // center line
+  for(let x=0;x<w;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+}
+
+function drawTrace(ctx, buf, color, w, h, lo, hi){
   if(buf.length < 2) return;
-  ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.shadowColor = color; ctx.shadowBlur = 3;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5;
   ctx.beginPath();
   const step = w / BUF_LEN;
-  const span = Math.max(hi - lo, 1);
+  const span = hi - lo;
+  const offset = BUF_LEN - buf.length;
   buf.forEach((v,i)=>{
-    const x = i*step;
-    const norm = (v-lo)/span;
-    const y = h - (norm*h*0.85) - h*0.075;
+    const x = (i + offset) * step;
+    const norm = (v - lo) / span;
+    const y = h - norm * h;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   });
-  ctx.stroke(); ctx.shadowBlur = 0;
+  ctx.stroke();
 }
 
-function render(){
+function renderPanel(ctx, canvas, series, range){
   const w = canvas.getBoundingClientRect().width;
   const h = canvas.getBoundingClientRect().height;
   ctx.clearRect(0,0,w,h);
-  drawGrid(w,h);
-  if(rawBuf.length>1){
-    const rLo = Math.min(...rawBuf), rHi = Math.max(...rawBuf);
-    drawTrace(rawBuf, '#8B97A2', w, h, rLo, rHi);
-  }
-  if(filtBuf.length>1){
-    const fLo = Math.min(...filtBuf), fHi = Math.max(...filtBuf);
-    drawTrace(filtBuf, '#4FD8C4', w, h, fLo, fHi);
-  }
+  drawGrid(ctx, w, h);
+  for(const [buf, color] of series) drawTrace(ctx, buf, color, w, h, range[0], range[1]);
+}
+
+function render(){
+  renderPanel(rawCtx, document.getElementById('rawChart'), [[rawBuf, getComputedColor('--raw')]], RAW_RANGE);
+  renderPanel(filtCtx, document.getElementById('filtChart'), [[filtBuf, getComputedColor('--filt')]], FILT_RANGE);
+  renderPanel(imuCtx, document.getElementById('imuChart'), [
+    [axBuf, getComputedColor('--ax')],
+    [ayBuf, getComputedColor('--ay')],
+    [azBuf, getComputedColor('--az')],
+  ], ACCEL_RANGE);
   requestAnimationFrame(render);
 }
+
+let cssColorCache = {};
+function getComputedColor(varName){
+  if(cssColorCache[varName]) return cssColorCache[varName];
+  const c = getComputedStyle(document.body).getPropertyValue(varName).trim();
+  cssColorCache[varName] = c;
+  return c;
+}
+
 render();
 
 function setStatus(cls, text){
@@ -131,20 +192,47 @@ function setStatus(cls, text){
   pill.textContent = text;
 }
 
+function updateAccelBanner(ax, ay, az){
+  const worst = Math.max(Math.abs(ax), Math.abs(ay), Math.abs(az));
+  if(!accelSaturated && worst >= ACCEL_SAT_ON) accelSaturated = true;
+  else if(accelSaturated && worst < ACCEL_SAT_OFF) accelSaturated = false;
+
+  const banner = document.getElementById('accelBanner');
+  if(accelSaturated){
+    const axis = Math.abs(ax) === worst ? 'X' : (Math.abs(ay) === worst ? 'Y' : 'Z');
+    banner.textContent = `⚠ Accel ${axis} at ${worst.toFixed(2)} m/s² — near the ±19.61 m/s² (±2g) sensor limit. If the board is stationary, check wiring/I2C connection to the MPU6050.`;
+    banner.classList.add('show');
+  } else {
+    banner.classList.remove('show');
+  }
+}
+
+function pushBuf(buf, v){
+  buf.push(v);
+  if(buf.length > BUF_LEN) buf.shift();
+}
+
 function handleLine(line){
-  const parts = line.trim().split(',');
+  line = line.trim();
+  if(!line) return;
+  if(line.startsWith('#')){
+    document.getElementById('deviceMsg').textContent = line.slice(1).trim();
+    return;
+  }
+  const parts = line.split(',');
   if(parts.length !== 6) return;
-  if(!headerSeen && isNaN(parseFloat(parts[0]))){ headerSeen = true; return; } // skip header line
+  if(!headerSeen && isNaN(parseFloat(parts[0]))){ headerSeen = true; return; }
   const [raw, filtered, bpm, ax, ay, az] = parts.map(Number);
   if(isNaN(raw)) return;
 
-  rawBuf.push(raw); if(rawBuf.length>BUF_LEN) rawBuf.shift();
-  filtBuf.push(filtered); if(filtBuf.length>BUF_LEN) filtBuf.shift();
+  pushBuf(rawBuf, raw);
+  pushBuf(filtBuf, filtered);
+  pushBuf(axBuf, ax);
+  pushBuf(ayBuf, ay);
+  pushBuf(azBuf, az);
 
-  document.getElementById('bpmVal').textContent = bpm > 0 ? bpm.toFixed(0) : '—';
-  document.getElementById('axVal').textContent = ax.toFixed(2);
-  document.getElementById('ayVal').textContent = ay.toFixed(2);
-  document.getElementById('azVal').textContent = az.toFixed(2);
+  document.getElementById('bpmVal').innerHTML = (bpm > 0 ? bpm.toFixed(0) : '—') + ' <span class="unit">bpm</span>';
+  updateAccelBanner(ax, ay, az);
 }
 
 async function connectDevice(){

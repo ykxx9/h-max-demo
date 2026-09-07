@@ -1,5 +1,6 @@
 /*
   ESP32-S3 ECG + IMU with on-device filtering and beat detection
+
   Wiring: BioShield OUT -> GPIO4, both BioShield and MPU6050 at 3.3V,
   MPU6050 SDA -> GPIO8, SCL -> GPIO9, common GND.
 
@@ -7,162 +8,36 @@
   like MAX30003 would have -- lets us match the already-validated
   250Hz filter/detector design exactly, no resampling needed).
 
-  Filter chain: 0.5Hz highpass -> 40Hz lowpass -> 50Hz notch (mains hum),
-  each a standard RBJ-cookbook biquad. Beat detection: derivative ->
-  square -> moving-window integration -> adaptive threshold, standard
-  Pan-Tompkins method, 2-second warm-up before reporting confirmed beats.
-
-  NOTE: this is a fresh implementation of the same documented method
-  already validated elsewhere in this project's browser tool -- it has
-  NOT itself been through that same validation yet. Treat what you see
-  now as the first real test of this specific code.
+  Filter + detector: ecg_pipeline.h, a faithful port of the health-companion
+  reference project's validated ECG pipeline. See that file's header for
+  provenance and validation. Re-confirmed by ../tools/validate_filter.py
+  (reproduces the reference project's documented 98.86% Se / 99.03% +P
+  against MIT-BIH exactly) and ../tools/test_ecg_pipeline_desktop.cpp
+  (this exact header, desktop-tested against a synthetic 72 BPM signal).
 
   Serial output (115200 baud), one line per sample:
     raw,filtered,bpm,ax,ay,az
-  bpm is 0 until the first confirmed beat after warm-up.
+  bpm is 0 until the first confirmed beat after warm-up. ax/ay/az are in
+  m/s^2 (+-2g range -> +-19.61 m/s^2).
 */
 
 #include <Wire.h>
-#include <math.h>
+#include "ecg_pipeline.h"
 
 #define ECG_PIN 4
-#define FS 250.0f
-#define SAMPLE_INTERVAL_US (uint32_t)(1000000.0f / FS)
+#define SAMPLE_INTERVAL_US (uint32_t)(1000000.0f / EcgPipeline::FS)
 
 #define MPU_ADDR 0x68
 #define MPU_PWR_MGMT_1 0x6B
 #define MPU_ACCEL_XOUT_H 0x3B
+#define MPU_WHO_AM_I 0x75
 
-// ---------- generic biquad (RBJ cookbook) ----------
-struct Biquad {
-  float b0, b1, b2, a1, a2;
-  float z1 = 0, z2 = 0;
-  float process(float in) {
-    float out = b0 * in + z1;
-    z1 = b1 * in + z2 - a1 * out;
-    z2 = b2 * in - a2 * out;
-    return out;
-  }
-};
-
-void makeHighpass(Biquad &f, float f0, float fs, float Q) {
-  float w0 = 2.0f * PI * f0 / fs;
-  float alpha = sin(w0) / (2.0f * Q);
-  float cosw0 = cos(w0);
-  float a0 = 1 + alpha;
-  f.b0 = ((1 + cosw0) / 2) / a0;
-  f.b1 = (-(1 + cosw0)) / a0;
-  f.b2 = ((1 + cosw0) / 2) / a0;
-  f.a1 = (-2 * cosw0) / a0;
-  f.a2 = (1 - alpha) / a0;
-}
-
-void makeLowpass(Biquad &f, float f0, float fs, float Q) {
-  float w0 = 2.0f * PI * f0 / fs;
-  float alpha = sin(w0) / (2.0f * Q);
-  float cosw0 = cos(w0);
-  float a0 = 1 + alpha;
-  f.b0 = ((1 - cosw0) / 2) / a0;
-  f.b1 = (1 - cosw0) / a0;
-  f.b2 = ((1 - cosw0) / 2) / a0;
-  f.a1 = (-2 * cosw0) / a0;
-  f.a2 = (1 - alpha) / a0;
-}
-
-void makeNotch(Biquad &f, float f0, float fs, float Q) {
-  float w0 = 2.0f * PI * f0 / fs;
-  float alpha = sin(w0) / (2.0f * Q);
-  float cosw0 = cos(w0);
-  float a0 = 1 + alpha;
-  f.b0 = 1.0f / a0;
-  f.b1 = (-2 * cosw0) / a0;
-  f.b2 = 1.0f / a0;
-  f.a1 = (-2 * cosw0) / a0;
-  f.a2 = (1 - alpha) / a0;
-}
-
-Biquad hp, lp, notch;
-
-// ---------- Pan-Tompkins-style beat detection ----------
-#define DERIV_LEN 5
-float derivBuf[DERIV_LEN] = {0};
-
-#define INTEG_WINDOW 38  // ~150ms at 250Hz
-float integBuf[INTEG_WINDOW] = {0};
-int integIdx = 0;
-float integSum = 0;
-
-float SPKI = 0, NPKI = 0, THRESHOLD = 0;
-bool thresholdsInit = false;
-
-unsigned long lastPeakMs = 0;
-const unsigned long REFRACTORY_MS = 250; // ~240bpm cap
-const unsigned long WARMUP_MS = 2000;
-unsigned long startMs = 0;
-
-float bpmHistory[4] = {0, 0, 0, 0};
-int bpmHistIdx = 0;
+EcgPipeline::EcgSampleProcessor ecg;
 float currentBpm = 0;
 
-float derivative(float x) {
-  for (int i = 0; i < DERIV_LEN - 1; i++) derivBuf[i] = derivBuf[i + 1];
-  derivBuf[DERIV_LEN - 1] = x;
-  // simple 5-point derivative approximation
-  return (2 * derivBuf[4] + derivBuf[3] - derivBuf[1] - 2 * derivBuf[0]) / 8.0f;
-}
-
-float movingWindowIntegrate(float x) {
-  integSum -= integBuf[integIdx];
-  integBuf[integIdx] = x;
-  integSum += x;
-  integIdx = (integIdx + 1) % INTEG_WINDOW;
-  return integSum / INTEG_WINDOW;
-}
-
-void updateBpm(unsigned long nowMs) {
-  if (lastPeakMs > 0) {
-    unsigned long rr = nowMs - lastPeakMs;
-    if (rr > 272 && rr < 2000) { // sane RR bounds (30-220bpm)
-      float bpm = 60000.0f / rr;
-      bpmHistory[bpmHistIdx] = bpm;
-      bpmHistIdx = (bpmHistIdx + 1) % 4;
-      float sum = 0; int n = 0;
-      for (int i = 0; i < 4; i++) if (bpmHistory[i] > 0) { sum += bpmHistory[i]; n++; }
-      if (n > 0) currentBpm = sum / n;
-    }
-  }
-  lastPeakMs = nowMs;
-}
-
-void processDetector(float filteredSample, unsigned long nowMs) {
-  float d = derivative(filteredSample);
-  float sq = d * d;
-  float integrated = movingWindowIntegrate(sq);
-
-  if (!thresholdsInit) {
-    // seed thresholds from the first bit of signal
-    SPKI = integrated;
-    NPKI = integrated * 0.5f;
-    THRESHOLD = NPKI + 0.25f * (SPKI - NPKI);
-    thresholdsInit = true;
-    return;
-  }
-
-  THRESHOLD = NPKI + 0.25f * (SPKI - NPKI);
-
-  bool pastRefractory = (nowMs - lastPeakMs) > REFRACTORY_MS;
-  bool pastWarmup = (nowMs - startMs) > WARMUP_MS;
-
-  if (integrated > THRESHOLD && pastRefractory) {
-    SPKI = 0.125f * integrated + 0.875f * SPKI;
-    if (pastWarmup) updateBpm(nowMs);
-    else lastPeakMs = nowMs; // keep refractory logic sane during warmup, don't report bpm yet
-  } else {
-    NPKI = 0.125f * integrated + 0.875f * NPKI;
-  }
-}
-
-// ---------- MPU6050 ----------
+// =============================================================================
+// MPU6050 -- fixed byte-order bug (see mpuReadAccel below).
+// =============================================================================
 void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
@@ -170,14 +45,38 @@ void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
+uint8_t mpuReadByte(uint8_t reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MPU_ADDR, 1);
+  return Wire.read();
+}
+
 bool mpuReadAccel(float &ax, float &ay, float &az) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(MPU_ACCEL_XOUT_H);
   if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom((int)MPU_ADDR, 6) != 6) return false;
-  int16_t rawX = (Wire.read() << 8) | Wire.read();
-  int16_t rawY = (Wire.read() << 8) | Wire.read();
-  int16_t rawZ = (Wire.read() << 8) | Wire.read();
+
+  // Read each byte into its own sequenced statement -- do NOT combine two
+  // Wire.read() calls in one expression like `(Wire.read()<<8)|Wire.read()`.
+  // C++ does not guarantee left-to-right evaluation order for the operands
+  // of `<<`/`|`, so a compiler is free to call the two Wire.read()s in
+  // either order; since each call also advances Wire's internal read
+  // pointer, evaluating them in the "wrong" order silently swaps the
+  // MSB/LSB bytes. That byte swap was the actual root cause of the
+  // near-saturated (-19.6 m/s^2, i.e. raw=0x8000) Accel Y readings seen
+  // while the board was stationary: a genuinely small Y reading (MSB
+  // near 0x00) got reassembled with the LSB byte in the high position.
+  uint8_t xh = Wire.read(); uint8_t xl = Wire.read();
+  uint8_t yh = Wire.read(); uint8_t yl = Wire.read();
+  uint8_t zh = Wire.read(); uint8_t zl = Wire.read();
+
+  int16_t rawX = (int16_t)((xh << 8) | xl);
+  int16_t rawY = (int16_t)((yh << 8) | yl);
+  int16_t rawZ = (int16_t)((zh << 8) | zl);
+
   ax = rawX / 16384.0f * 9.80665f;
   ay = rawY / 16384.0f * 9.80665f;
   az = rawZ / 16384.0f * 9.80665f;
@@ -188,6 +87,7 @@ unsigned long lastSampleTime = 0;
 unsigned long lastAccelReadTime = 0;
 const unsigned long ACCEL_INTERVAL_MS = 100;
 float ax = 0, ay = 0, az = 0;
+bool mpuOk = false;
 
 void setup() {
   Serial.begin(115200);
@@ -195,15 +95,18 @@ void setup() {
 
   analogReadResolution(12);
 
-  makeHighpass(hp, 0.5f, FS, 0.707f);
-  makeLowpass(lp, 40.0f, FS, 0.707f);
-  makeNotch(notch, 50.0f, FS, 10.0f);
-
   Wire.begin(8, 9);
-  mpuWrite(MPU_PWR_MGMT_1, 0x00);
-  delay(100);
+  uint8_t whoAmI = mpuReadByte(MPU_WHO_AM_I);
+  mpuOk = (whoAmI == 0x68);
+  if (mpuOk) {
+    mpuWrite(MPU_PWR_MGMT_1, 0x01); // wake from sleep, clock = PLL w/ X-axis gyro reference
+    delay(100);
+  } else {
+    Serial.print("# MPU6050 not responding (WHO_AM_I=0x");
+    Serial.print(whoAmI, HEX);
+    Serial.println(", expected 0x68) -- check wiring/power/I2C address, ax/ay/az will read 0");
+  }
 
-  startMs = millis();
   Serial.println("raw,filtered,bpm,ax,ay,az");
 }
 
@@ -214,11 +117,10 @@ void loop() {
     unsigned long nowMs = millis();
 
     int raw = analogRead(ECG_PIN);
-    float filtered = notch.process(lp.process(hp.process((float)raw)));
+    float filtered, bpm;
+    if (ecg.process((float)raw, &filtered, &bpm)) currentBpm = bpm;
 
-    processDetector(filtered, nowMs);
-
-    if (nowMs - lastAccelReadTime >= ACCEL_INTERVAL_MS) {
+    if (mpuOk && (nowMs - lastAccelReadTime >= ACCEL_INTERVAL_MS)) {
       lastAccelReadTime = nowMs;
       mpuReadAccel(ax, ay, az);
     }
