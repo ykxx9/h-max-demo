@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ESP32-S3 ECG + IMU Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#10161B; --panel:#19222B; --panel-2:#1E2932; --line:#2A3541;
+    --trace:#4FD8C4; --trace-dim:#2C6E64; --raw:#8B97A2; --alert:#FF6B54;
+    --text:#ECEDE9; --muted:#8B97A2;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:var(--ink);color:var(--text);font-family:'Sora',sans-serif;}
+  body{padding:24px;min-height:100vh;}
+  .wrap{max-width:1000px;margin:0 auto;}
+  h1{font-size:19px;margin:0 0 4px 0;}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 20px 0;}
+
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;}
+  button{font-family:'Sora',sans-serif;font-weight:600;font-size:13.5px;padding:10px 18px;border-radius:8px;
+    border:1px solid var(--line);background:var(--panel-2);color:var(--text);cursor:pointer;}
+  button:hover{border-color:var(--trace-dim);}
+  button.primary{background:var(--trace);color:#0B1512;border-color:var(--trace);}
+  .status{font-family:'IBM Plex Mono',monospace;font-size:12px;padding:6px 12px;border-radius:20px;
+    border:1px solid var(--line);color:var(--muted);}
+  .status.on{color:var(--trace);border-color:var(--trace-dim);}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:16px;}
+  .card h2{font-size:12.5px;font-weight:600;color:var(--muted);margin:0 0 12px 0;}
+  canvas{width:100%;height:220px;background:#0D1317;border-radius:8px;border:1px solid var(--line);}
+  .legend{display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:6px;}
+  .dot{width:10px;height:10px;border-radius:2px;}
+
+  .row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;}
+  .vital{background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:14px;text-align:center;}
+  .vital .label{font-size:11px;color:var(--muted);margin-bottom:6px;}
+  .vital .value{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:var(--trace);}
+  .vital .unit{font-size:11px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ESP32-S3 — ECG + IMU Live</h1>
+  <p class="sub">Web Serial, 115200 baud. Close Arduino IDE's Serial Monitor/Plotter first — only one program can hold the port.</p>
+
+  <div class="bar">
+    <button class="primary" id="btnConnect">Connect device</button>
+    <span class="status" id="statusPill">Not connected</span>
+  </div>
+
+  <div class="card">
+    <h2>ECG — raw vs. filtered</h2>
+    <canvas id="ecg"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:#8B97A2"></span>Raw</span>
+      <span><span class="dot" style="background:#4FD8C4"></span>Filtered</span>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="vital"><div class="label">Heart Rate</div><div class="value" id="bpmVal">—</div><div class="unit">bpm</div></div>
+    <div class="vital"><div class="label">Accel X</div><div class="value" id="axVal">—</div><div class="unit">m/s²</div></div>
+    <div class="vital"><div class="label">Accel Y</div><div class="value" id="ayVal">—</div><div class="unit">m/s²</div></div>
+    <div class="vital"><div class="label">Accel Z</div><div class="value" id="azVal">—</div><div class="unit">m/s²</div></div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('ecg');
+const ctx = canvas.getContext('2d');
+function fitCanvas(){
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+const BUF_LEN = 500;
+let rawBuf = [];
+let filtBuf = [];
+let port, reader, keepReading = false;
+let lineBuf = '';
+let headerSeen = false;
+
+function drawGrid(w,h){
+  ctx.strokeStyle = '#182028'; ctx.lineWidth = 1;
+  for(let x=0;x<w;x+=25){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+  for(let y=0;y<h;y+=25){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+}
+
+function drawTrace(buf, color, w, h, lo, hi){
+  if(buf.length < 2) return;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.shadowColor = color; ctx.shadowBlur = 3;
+  ctx.beginPath();
+  const step = w / BUF_LEN;
+  const span = Math.max(hi - lo, 1);
+  buf.forEach((v,i)=>{
+    const x = i*step;
+    const norm = (v-lo)/span;
+    const y = h - (norm*h*0.85) - h*0.075;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.stroke(); ctx.shadowBlur = 0;
+}
+
+function render(){
+  const w = canvas.getBoundingClientRect().width;
+  const h = canvas.getBoundingClientRect().height;
+  ctx.clearRect(0,0,w,h);
+  drawGrid(w,h);
+  if(rawBuf.length>1){
+    const rLo = Math.min(...rawBuf), rHi = Math.max(...rawBuf);
+    drawTrace(rawBuf, '#8B97A2', w, h, rLo, rHi);
+  }
+  if(filtBuf.length>1){
+    const fLo = Math.min(...filtBuf), fHi = Math.max(...filtBuf);
+    drawTrace(filtBuf, '#4FD8C4', w, h, fLo, fHi);
+  }
+  requestAnimationFrame(render);
+}
+render();
+
+function setStatus(cls, text){
+  const pill = document.getElementById('statusPill');
+  pill.className = 'status ' + cls;
+  pill.textContent = text;
+}
+
+function handleLine(line){
+  const parts = line.trim().split(',');
+  if(parts.length !== 6) return;
+  if(!headerSeen && isNaN(parseFloat(parts[0]))){ headerSeen = true; return; } // skip header line
+  const [raw, filtered, bpm, ax, ay, az] = parts.map(Number);
+  if(isNaN(raw)) return;
+
+  rawBuf.push(raw); if(rawBuf.length>BUF_LEN) rawBuf.shift();
+  filtBuf.push(filtered); if(filtBuf.length>BUF_LEN) filtBuf.shift();
+
+  document.getElementById('bpmVal').textContent = bpm > 0 ? bpm.toFixed(0) : '—';
+  document.getElementById('axVal').textContent = ax.toFixed(2);
+  document.getElementById('ayVal').textContent = ay.toFixed(2);
+  document.getElementById('azVal').textContent = az.toFixed(2);
+}
+
+async function connectDevice(){
+  if(!('serial' in navigator)){
+    alert('Web Serial not available. Use Chrome or Edge, opened as a local file, not an embedded preview.');
+    return;
+  }
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    setStatus('on','Connected');
+    keepReading = true;
+    readLoop();
+  }catch(err){
+    console.error(err);
+    setStatus('','Not connected');
+  }
+}
+
+async function readLoop(){
+  const decoder = new TextDecoderStream();
+  const inputDone = port.readable.pipeTo(decoder.writable);
+  reader = decoder.readable.getReader();
+  try{
+    while(keepReading){
+      const {value, done} = await reader.read();
+      if(done) break;
+      if(value){
+        lineBuf += value;
+        let lines = lineBuf.split('\n');
+        lineBuf = lines.pop();
+        for(const line of lines) handleLine(line);
+      }
+    }
+  }catch(err){
+    console.error('Read error', err);
+  }
+}
+
+document.getElementById('btnConnect').addEventListener('click', connectDevice);
+</script>
+</body>
+</html>
